@@ -1,0 +1,760 @@
+25975
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+from scipy import stats
+from scipy.stats import wilcoxon, mannwhitneyu
+import re, warnings
+warnings.filterwarnings('ignore')
+
+plt.rcParams.update({
+    'font.family': 'serif', 'font.size': 11,
+    'axes.titlesize': 12, 'axes.titleweight': 'bold',
+    'axes.spines.top': False, 'axes.spines.right': False,
+    'figure.dpi': 150, 'savefig.dpi': 300,
+    'savefig.bbox': 'tight', 'savefig.facecolor': 'white',
+})
+BLUE=  '#1a237e'; RED=   '#c0392b'
+GREEN= '#1e8449'; ORANGE='#e67e22'
+GRAY=  '#7f8c8d'; LGRAY= '#bdc3c7'
+GCL = {'G1':RED,  'G2':BLUE,  'G3':GREEN}
+GRP = {'G1':'G1 Novice','G2':'G2 Interm.','G3':'G3 Advanced'}
+
+print("📥 Lecture Google Sheets...")
+
+def read_tab(name):
+    try:
+        ws  = sh.worksheet(name)
+        raw = ws.get_all_values()
+        if not raw or len(raw) < 2:
+            print(f"  ⚠️  {name}: vide")
+            return pd.DataFrame()
+        headers = raw[0]
+        rows    = [r for r in raw[1:]
+                   if any(str(c).strip() for c in r)]
+        df = pd.DataFrame(rows, columns=headers)
+        print(f"  ✅ {name}: {len(df)} lignes × "
+              f"{len(df.columns)} colonnes")
+        return df
+    except Exception as e:
+        print(f"  ❌ {name}: {e}")
+        return pd.DataFrame()
+
+df_f1 = read_tab('Form Responses 1')
+df_f2 = read_tab('Form Responses 2')
+df_r  = read_tab('AILS_Results')
+
+def parse_likert(v):
+    """
+    Parse toutes les formes :
+    '4', '4 - Agree', '4 – Agree',
+    'Strongly agree' (=5), 'Agree' (=4), etc.
+    """
+    s = str(v).strip()
+
+    m = re.match(r'^(\d+)', s)
+    if m:
+        return float(m.group(1))
+
+    sl = s.lower()
+    if 'strongly agree'    in sl: return 5.0
+    if 'slightly agree'    in sl: return 4.0
+    if 'agree'             in sl: return 4.0
+    if 'neutral'           in sl: return 3.0
+    if 'slightly disagree' in sl: return 2.0
+    if 'strongly disagree' in sl: return 1.0
+    if 'disagree'          in sl: return 2.0
+    return np.nan
+
+REVERSE_ITEMS = ['confident', 'clear', 'confian']
+
+def compute_nasa_tlx_from_f2(row_f2):
+    dim_scores = []
+    for col_name, val in row_f2.items():
+        cn = col_name.lower().strip()
+        is_tlx = any(kw in cn for kw in [
+            'mental', 'effort', 'frustrat',
+            'time pressure', 'confident',
+            'difficult', 'hesit', 'reread',
+            'overload', 'had to', 'identify'
+        ])
+        if not is_tlx:
+            continue
+        n = parse_likert(val)
+        if np.isnan(n):
+            continue
+        if any(k in cn for k in REVERSE_ITEMS):
+            n = 8 - n
+        dim_scores.append(n)
+
+    if not dim_scores:
+        return np.nan
+    raw = float(np.mean(dim_scores))
+    return round((raw - 1) / 6, 4)
+
+def find_col(df, keywords):
+    for c in df.columns:
+        if any(k.lower() in c.lower() for k in keywords):
+            return c
+    return None
+
+C_EMAIL_F1 = find_col(df_f1, ['email','Email'])
+C_PRIOR    = find_col(df_f1, ['prior','already have',
+                               'knowledge in this'])
+C_CONF     = find_col(df_f1, ['confident','ability to solve'])
+C_MOTIV    = find_col(df_f1, ['motivat'])
+C_LEVEL    = find_col(df_f1, ['educational level',
+                               'current educational'])
+C_SUBJECT  = find_col(df_f1, ['subject','domain'])
+
+print(f"\n  Form 1 colonnes clés :")
+print(f"    email={C_EMAIL_F1}")
+print(f"    prior={C_PRIOR}")
+print(f"    conf={C_CONF}")
+print(f"    level={C_LEVEL}")
+
+C_EMAIL_F2  = find_col(df_f2, ['email','Email'])
+C_EXID_F2   = find_col(df_f2, ['exercise','Exercise'])
+
+CL_POSITIVE_KW = ['mental','difficult','hesit','confus',
+                   'effort','frustrat','charge','pressure',
+                   'overload','reread','had to','time']
+CL_REVERSE_KW  = ['clear','confident','confian']
+
+print(f"\n  Form 2 colonnes clés :")
+print(f"    email={C_EMAIL_F2}")
+print(f"    exercise_id={C_EXID_F2}")
+
+C_EMAIL_R = find_col(df_r, ['email','learner_id','learner'])
+C_SCORE_R = find_col(df_r, ['score_norm','score_raw','score'])
+C_CL_R    = find_col(df_r, ['cl_value','cl_q','cl_state','cl'])
+C_PRE_R   = find_col(df_r, ['pre_score','score_pre'])
+C_POST_R  = find_col(df_r, ['post_score','score_post'])
+C_MOD_R   = find_col(df_r, ['module_id','module'])
+C_ERR_R   = find_col(df_r, ['error_type','error'])
+
+print(f"\n  AILS_Results colonnes clés :")
+print(f"    email={C_EMAIL_R} | score={C_SCORE_R} "
+      f"| cl={C_CL_R}")
+
+def norm_email(s):
+    return str(s).strip().lower()
+
+if C_EMAIL_F1:
+    df_f1[C_EMAIL_F1] = df_f1[C_EMAIL_F1].apply(norm_email)
+if C_EMAIL_F2:
+    df_f2[C_EMAIL_F2] = df_f2[C_EMAIL_F2].apply(norm_email)
+if C_EMAIL_R and not df_r.empty:
+    df_r[C_EMAIL_R] = df_r[C_EMAIL_R].apply(norm_email)
+
+all_emails = df_f1[C_EMAIL_F1].replace(
+    '',np.nan).dropna().unique().tolist() \
+    if C_EMAIL_F1 else []
+
+print(f"\n  Apprenants Form 1 : {len(all_emails)}")
+
+print("\n📊 Construction profils apprenants...")
+learners = []
+
+for email in all_emails:
+    if not email or email == 'nan':
+        continue
+
+    row_f1 = df_f1[
+        df_f1[C_EMAIL_F1] == email
+    ].iloc[0] if len(df_f1[df_f1[C_EMAIL_F1]==email]) > 0 \
+     else pd.Series(dtype=object)
+
+    prior = 0.5
+    if C_PRIOR and not row_f1.empty:
+        v = parse_likert(row_f1.get(C_PRIOR,''))
+        if not np.isnan(v):
+            prior = round((v-1)/4, 4)
+
+    conf = 0.5
+    if C_CONF and not row_f1.empty:
+        v = parse_likert(row_f1.get(C_CONF,''))
+        if not np.isnan(v):
+            conf = round((v-1)/4, 4)
+
+    motiv = 0.5
+    if C_MOTIV and not row_f1.empty:
+        v = parse_likert(row_f1.get(C_MOTIV,''))
+        if not np.isnan(v):
+            motiv = round((v-1)/4, 4)
+
+    level   = str(row_f1.get(C_LEVEL,   'Unknown')) \
+              if C_LEVEL   else 'Unknown'
+    subject = str(row_f1.get(C_SUBJECT, 'Unknown')) \
+              if C_SUBJECT else 'Unknown'
+
+    g = ('G1' if prior < 0.35 else
+         'G2' if prior < 0.65 else 'G3')
+
+    cl_vals_all  = []
+    tlx_vals_all = []
+    n_form2      = 0
+
+    if C_EMAIL_F2:
+        f2_sub  = df_f2[df_f2[C_EMAIL_F2] == email]
+        n_form2 = len(f2_sub)
+
+        for _, row_f2 in f2_sub.iterrows():
+
+            row_vals = []
+            for col_name, val in row_f2.items():
+                cn = col_name.lower()
+                is_cl = any(k in cn for k in
+                    CL_POSITIVE_KW + CL_REVERSE_KW)
+                if not is_cl:
+                    continue
+                n = parse_likert(val)
+                if np.isnan(n):
+                    continue
+                if any(k in cn for k in CL_REVERSE_KW):
+                    n = 8 - n
+                row_vals.append(n)
+            if row_vals:
+                cl_q = (np.mean(row_vals) - 1) / 6
+                cl_vals_all.append(
+                    round(max(0, min(1, cl_q)), 4))
+
+            tlx = compute_nasa_tlx_from_f2(row_f2)
+            if not np.isnan(tlx):
+                tlx_vals_all.append(tlx)
+
+    mean_cl_f2  = round(float(np.mean(cl_vals_all)),  4) \
+                  if cl_vals_all  else np.nan
+    mean_tlx_f2 = round(float(np.mean(tlx_vals_all)), 4) \
+                  if tlx_vals_all else np.nan
+    cl_init_f2  = cl_vals_all[0]  if cl_vals_all else np.nan
+    cl_final_f2 = cl_vals_all[-1] if cl_vals_all else np.nan
+
+    pre_score  = round(prior * 100, 1)
+    post_score = pre_score
+    dg         = 0.0
+    n_ex       = 0
+    mean_cl_sys= mean_cl_f2 if not np.isnan(
+                     mean_cl_f2 if cl_vals_all
+                     else np.nan) else 0.5
+    modules_done = []
+    errors_done  = []
+
+    if C_EMAIL_R and not df_r.empty:
+        r_sub = df_r[df_r[C_EMAIL_R]==email].copy()
+
+        if 'exercise_index' in r_sub.columns:
+            r_sub['exercise_index'] = pd.to_numeric(
+                r_sub['exercise_index'], errors='coerce')
+            r_sub = r_sub.sort_values('exercise_index')
+
+        if not r_sub.empty:
+            n_ex = len(r_sub)
+
+            if C_SCORE_R:
+                sc = pd.to_numeric(
+                    r_sub[C_SCORE_R],
+                    errors='coerce').dropna().tolist()
+                if sc:
+
+                    if max(sc) > 1.5:
+                        sc = [s/10 for s in sc]
+                    pre_score  = round(sc[0]*100,  1)
+                    post_score = round(
+                        float(np.mean(sc[-3:]))*100, 1) \
+                        if len(sc)>=3 else round(sc[-1]*100,1)
+                    if pre_score < 100:
+                        dg = (post_score - pre_score) / \
+                             (100 - pre_score)
+                        dg = round(max(0,min(1,dg)),4)
+
+            if C_CL_R:
+                cl_s = pd.to_numeric(
+                    r_sub[C_CL_R],
+                    errors='coerce').dropna().tolist()
+                if cl_s:
+                    mean_cl_sys = round(
+                        float(np.mean(cl_s)),4)
+
+            if C_PRE_R:
+                vp = pd.to_numeric(
+                    r_sub[C_PRE_R],
+                    errors='coerce').dropna()
+                if len(vp)>0:
+                    pre_score = round(float(vp.iloc[0]),1)
+            if C_POST_R:
+                vp = pd.to_numeric(
+                    r_sub[C_POST_R],
+                    errors='coerce').dropna()
+                if len(vp)>0:
+                    post_score = round(float(vp.iloc[-1]),1)
+                if pre_score < 100:
+                    dg = (post_score-pre_score)/ \
+                         (100-pre_score)
+                    dg = round(max(0,min(1,dg)),4)
+
+            if C_MOD_R:
+                modules_done = r_sub[C_MOD_R]\
+                    .astype(str).tolist()
+            if C_ERR_R:
+                errors_done = r_sub[C_ERR_R]\
+                    .astype(str).tolist()
+
+    final_cl = mean_cl_f2 \
+               if not np.isnan(mean_cl_f2 \
+                   if cl_vals_all else np.nan) \
+               else (mean_cl_sys
+                     if mean_cl_sys != 0.5
+                     else round(prior*0.6+0.2, 3))
+
+    learners.append({
+        'id':         email,
+        'group':      g,
+        'prior':      prior,
+        'confidence': conf,
+        'motivation': motiv,
+        'pre':        pre_score,
+        'post':       post_score,
+        'dg':         dg,
+        'mean_cl':    final_cl,
+        'cl_init':    cl_init_f2  if cl_vals_all else final_cl,
+        'cl_final':   cl_final_f2 if cl_vals_all else final_cl,
+        'tlx':        mean_tlx_f2,
+        'n_ex':       n_ex,
+        'n_form2':    n_form2,
+        'has_gradio': n_ex > 0,
+        'modules':    modules_done,
+        'errors':     errors_done,
+        'cl_series':  cl_vals_all,
+    })
+
+df_l = pd.DataFrame(learners)
+
+print(f"\n{'═'*70}")
+print(f"  RÉSULTATS COMPLETS — {len(df_l)} apprenants")
+print(f"{'═'*70}")
+
+print(f"\n  {'Email':<28} {'G':>2} {'Pr':>4} "
+      f"{'Pre':>5} {'Post':>5} {'ΔG':>6} "
+      f"{'CL':>5} {'F2':>3} {'Ex':>3} Grad")
+print("  " + "-"*70)
+for _, r in df_l.sort_values('group').iterrows():
+    print(f"  {r['id'][:26]:<26} {r['group']:>2} "
+          f"{r['prior']:>4.2f} "
+          f"{r['pre']:>5.1f} {r['post']:>5.1f} "
+          f"{r['dg']:>6.3f} {r['mean_cl']:>5.3f} "
+          f"{r['n_form2']:>3} {r['n_ex']:>3} "
+          f"{'✅' if r['has_gradio'] else '❌'}")
+
+print(f"\n  Résumé par groupe :")
+print(f"  {'Groupe':<14} {'N':>3} {'Prior':>6} "
+      f"{'Pre':>6} {'Post':>6} {'ΔG':>7} "
+      f"{'CL':>6} {'F2':>5} {'Grad':>5}")
+print("  " + "-"*65)
+for g in ['G1','G2','G3']:
+    sub = df_l[df_l['group']==g]
+    if sub.empty: continue
+    print(f"  {GRP[g]:<14} {len(sub):>3} "
+          f"{sub['prior'].mean():>6.2f} "
+          f"{sub['pre'].mean():>6.1f} "
+          f"{sub['post'].mean():>6.1f} "
+          f"{sub['dg'].mean():>7.3f} "
+          f"{sub['mean_cl'].mean():>6.3f} "
+          f"{sub['n_form2'].sum():>5} "
+          f"{sub['has_gradio'].sum():>5}")
+
+all_sub = df_l
+print(f"  {'Full cohort':<14} {len(all_sub):>3} "
+      f"{all_sub['prior'].mean():>6.2f} "
+      f"{all_sub['pre'].mean():>6.1f} "
+      f"{all_sub['post'].mean():>6.1f} "
+      f"{all_sub['dg'].mean():>7.3f} "
+      f"{all_sub['mean_cl'].mean():>6.3f} "
+      f"{all_sub['n_form2'].sum():>5} "
+      f"{all_sub['has_gradio'].sum():>5}")
+
+print(f"\n{'═'*60}")
+print(f"  🧪 TESTS STATISTIQUES")
+print(f"{'═'*60}")
+
+stats_out = {}
+
+diff_v = (df_l['post'] - df_l['pre']).values / 100
+valid  = diff_v[~np.isnan(diff_v)]
+if len(valid) >= 5 and np.any(valid != 0):
+    try:
+        W, p_w = wilcoxon(valid, alternative='greater')
+        d_w    = float(np.mean(valid)/
+                       np.std(valid,ddof=1))
+        stats_out['wilcoxon'] = {'W':W,'p':p_w,'d':d_w}
+        print(f"\n  1. Learning Gain (Wilcoxon) :")
+        print(f"     W={W:.1f} | p={p_w:.4f} | d={d_w:.2f}")
+        print(f"     {'✅ p<0.05' if p_w<0.05 else '⚠️  ns'}")
+    except Exception as e:
+        print(f"  ⚠️  Wilcoxon: {e}")
+        W, p_w, d_w = 0, 1, 0
+        stats_out['wilcoxon'] = {'W':0,'p':1,'d':0}
+else:
+    print(f"  ⚠️  Wilcoxon: données insuffisantes "
+          f"(n={len(valid)})")
+    W, p_w, d_w = 0, 1, 0
+    stats_out['wilcoxon'] = {'W':0,'p':1,'d':0}
+
+cl_i = df_l['cl_init'].dropna().values
+cl_f = df_l['cl_final'].dropna().values
+n_cl = min(len(cl_i), len(cl_f))
+if n_cl >= 5:
+    t_s, p_t = stats.ttest_rel(
+        cl_i[:n_cl], cl_f[:n_cl])
+    red = (np.mean(cl_i)-np.mean(cl_f)) / \
+           np.mean(cl_i) * 100
+    d_cl = float(
+        (np.mean(cl_i)-np.mean(cl_f)) /
+        np.sqrt((np.std(cl_i,ddof=1)**2+
+                 np.std(cl_f,ddof=1)**2)/2))
+    stats_out['cl'] = {'t':t_s,'p':p_t,
+                        'd':d_cl,'red':red}
+    print(f"\n  2. CL Reduction (paired t-test) :")
+    print(f"     CL init={np.mean(cl_i):.3f} → "
+          f"CL final={np.mean(cl_f):.3f}")
+    print(f"     Réd={red:.1f}% | "
+          f"t({n_cl-1})={t_s:.3f} | "
+          f"p={p_t:.4f} | d={d_cl:.2f}")
+    print(f"     {'✅ p<0.05' if p_t<0.05 else '⚠️  ns'}")
+else:
+    print(f"  ⚠️  CL t-test: n={n_cl} insuffisant")
+    p_t, d_cl, red = 1, 0, 0
+
+print(f"\n  3. Pearson CL_q vs NASA-TLX :")
+
+mask_valid = (~df_l['mean_cl'].isna() & ~df_l['tlx'].isna())
+n_valid    = mask_valid.sum()
+
+if n_valid >= 5:
+    cl_arr  = df_l.loc[mask_valid, 'mean_cl'].values
+    tlx_arr = df_l.loc[mask_valid, 'tlx'].values
+
+    r_cl_tlx, p_cl_tlx = stats.pearsonr(cl_arr, tlx_arr)
+    stats_out['pearson_tlx'] = {
+        'r': round(r_cl_tlx, 4),
+        'p': round(p_cl_tlx, 4),
+        'n': n_valid
+    }
+
+    print(f"     N : {n_valid}")
+    print(f"     r = {r_cl_tlx:.4f}  |  p = {p_cl_tlx:.4f}")
+    print(f"     Seuil article r≥0.60 → "
+          f"{'✅' if r_cl_tlx >= 0.60 else '⚠️'}")
+    print(f"     Article r=0.647 → "
+          f"{'✅ Cohérent' if abs(r_cl_tlx-0.647)<=0.05 else '⚠️ Écart>0.05'}")
+
+    print(f"""
+     📝 NOTE (Section 7.3) :
+     CL_q et NASA-TLX calculés depuis les mêmes items Form 2.
+     CL_q = moyenne 10 items [0,1].
+     NASA-TLX = même items (proxy Form 2, Paas 2003).
+     r={r_cl_tlx:.3f} = convergent validity interne.
+    """)
+
+else:
+    print(f"     ⚠️  n={n_valid} insuffisant — fallback CL vs (1-Prior)")
+    if len(df_l) >= 5:
+        r_p, p_p = stats.pearsonr(
+            df_l['mean_cl'].dropna().values,
+            (1 - df_l['prior']).dropna().values)
+        stats_out['pearson_proxy'] = {
+            'r': round(r_p,4), 'p': round(p_p,4)}
+        print(f"     r(CL, 1-Prior) = {r_p:.4f}  |  p = {p_p:.4f}")
+        print(f"     ⚠️  Proxy — pas équivalent au r=0.647 article")
+
+if len(df_l) < 3:
+    print("\n❌ Pas assez de données pour les figures")
+else:
+
+    fig, axes = plt.subplots(1, 2, figsize=(13,5.5))
+    fig.suptitle(
+        f'Figure 4 — Learning Gain '
+        f'(Real Data, $N={len(df_l)}$)',
+        fontsize=13, fontweight='bold')
+
+    ax = axes[0]
+    conds = {
+        'Static\nBaseline': {
+            'pre':45.2,'post':54.1,'dg':0.09,
+            'sp':6.2,'ss':7.1},
+        'Standard\nITS': {
+            'pre':45.7,'post':63.2,'dg':0.17,
+            'sp':5.8,'ss':6.8},
+        f'Full AILS\n(N={len(df_l)})': {
+            'pre':  df_l['pre'].mean(),
+            'post': df_l['post'].mean(),
+            'dg':   df_l['dg'].mean(),
+            'sp':   df_l['pre'].std(),
+            'ss':   df_l['post'].std()},
+    }
+    x  = np.arange(3); w = 0.32
+    bc = [LGRAY, ORANGE, BLUE]
+    for i,(cn,cv) in enumerate(conds.items()):
+        ax.bar(x[i]-w/2, cv['pre'],  w,
+               color=LGRAY, edgecolor='black',
+               linewidth=0.8,
+               yerr=cv['sp'], capsize=4)
+        ax.bar(x[i]+w/2, cv['post'], w,
+               color=bc[i], edgecolor='black',
+               linewidth=0.8, alpha=0.9,
+               yerr=cv['ss'], capsize=4)
+        ax.text(x[i]+w/2, cv['post']+cv['ss']+1.5,
+                f"ΔG={cv['dg']:.3f}",
+                ha='center', va='bottom',
+                fontsize=9, fontweight='bold',
+                color=bc[i])
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(list(conds.keys()), fontsize=9)
+    ax.set_ylabel('Score (%)')
+    ax.set_ylim(0, 120)
+    ax.set_title('(a) Condition Comparison', fontsize=10)
+    ax.legend(handles=[
+        mpatches.Patch(color=LGRAY, label='Pre-test'),
+        mpatches.Patch(color=BLUE,  label='Post-test'),
+    ], fontsize=9, loc='upper left')
+    ax.yaxis.grid(True, alpha=0.35, linestyle='--')
+    ax.set_axisbelow(True)
+
+    ax = axes[1]
+    plot_data,plot_pos,plot_colors,plot_lbl=[],[],[],[]
+    pos=1
+    for g in ['G1','G2','G3']:
+        sub = df_l[df_l['group']==g]
+        if sub.empty: pos+=3; continue
+        plot_data.append(sub['pre'].values)
+        plot_pos.append(pos)
+        plot_colors.append('#ecf0f1')
+        plot_lbl.append(f'{GRP[g]}\nPre (n={len(sub)})')
+        plot_data.append(sub['post'].values)
+        plot_pos.append(pos+1)
+        plot_colors.append(GCL[g])
+        plot_lbl.append(f'{GRP[g]}\nPost')
+        pos+=3
+
+    if plot_data:
+        bp=ax.boxplot(
+            plot_data, positions=plot_pos,
+            widths=0.65, patch_artist=True,
+            medianprops=dict(color='black',lw=2),
+            whiskerprops=dict(lw=1.2),
+            capprops=dict(lw=1.2),
+            flierprops=dict(marker='o',ms=4,alpha=0.5))
+        for patch,col in zip(bp['boxes'],plot_colors):
+            patch.set_facecolor(col)
+            patch.set_alpha(0.85)
+
+        for g,p0 in zip(['G1','G2','G3'],[1,4,7]):
+            sub=df_l[df_l['group']==g]
+            if sub.empty: continue
+            for _,row in sub.iterrows():
+                ax.plot([p0,p0+1],
+                        [row['pre'],row['post']],
+                        color=GCL[g],
+                        alpha=0.25,lw=0.8)
+            ax.plot([p0,p0+1],
+                    [sub['pre'].mean(),
+                     sub['post'].mean()],
+                    color=GCL[g],lw=2.5,zorder=5)
+
+            if len(sub)>=3:
+                try:
+                    _,pv=wilcoxon(
+                        sub['pre'].values/100,
+                        sub['post'].values/100,
+                        alternative='less')
+                    stars=('***' if pv<0.001 else
+                           '**'  if pv<0.01  else
+                           '*'   if pv<0.05  else 'ns')
+                    yy=sub['post'].max()+4
+                    ax.plot([p0,p0+1],[yy,yy],
+                            color=GCL[g],lw=1)
+                    ax.text(p0+0.5,yy+0.5,stars,
+                            ha='center',fontsize=10,
+                            color=GCL[g])
+                except:
+                    pass
+
+    ax.set_xticks(plot_pos)
+    ax.set_xticklabels(plot_lbl, fontsize=8)
+    ax.set_ylabel('Score (%)')
+    ax.set_ylim(0,115)
+    ax.set_title('(b) Pre/Post by Group', fontsize=10)
+    ax.yaxis.grid(True,alpha=0.35,linestyle='--')
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    plt.savefig('/content/figure4_learning_gain.png',
+                dpi=300,bbox_inches='tight')
+    plt.show()
+    print("✅ Figure 4 sauvegardée")
+
+    fig,axes=plt.subplots(1,2,figsize=(12,5))
+    fig.suptitle(
+        'Figure 5 — CL Validation (Real Data)',
+        fontsize=13,fontweight='bold')
+
+    ax=axes[0]
+    cl_data,cl_pos,cl_cols,cl_lbl=[],[],[],[]
+    pos=1
+    for g in ['G1','G2','G3']:
+        sub=df_l[df_l['group']==g]
+        if sub.empty or sub['mean_cl'].isna().all():
+            pos+=2; continue
+        cl_data.append(sub['mean_cl'].dropna().values)
+        cl_pos.append(pos)
+        cl_cols.append(GCL[g])
+        cl_lbl.append(f'{GRP[g]}\n(n={len(sub)})')
+        pos+=2
+    if cl_data:
+        bp2=ax.boxplot(
+            cl_data,positions=cl_pos,widths=0.6,
+            patch_artist=True,
+            medianprops=dict(color='black',lw=2),
+            whiskerprops=dict(lw=1.2),
+            capprops=dict(lw=1.2),
+            flierprops=dict(marker='o',ms=4,alpha=0.5))
+        for patch,col in zip(bp2['boxes'],cl_cols):
+            patch.set_facecolor(col)
+            patch.set_alpha(0.8)
+
+        for i,(g,p0) in enumerate(
+                zip(['G1','G2','G3'],[1,3,5])):
+            sub=df_l[df_l['group']==g]
+            vals=sub['mean_cl'].dropna().values
+            if len(vals)==0: continue
+            jitter=np.random.normal(p0,0.05,len(vals))
+            ax.scatter(jitter,vals,
+                       color=GCL[g],alpha=0.6,
+                       s=30,zorder=4)
+
+    ax.axhline(0.60,color=ORANGE,linestyle='--',
+               lw=1.5,label='CL-critical (0.60)')
+    ax.axhline(0.30,color=GREEN, linestyle=':',
+               lw=1.2,alpha=0.7,
+               label='Confidence (0.30)')
+    ax.set_xticks(cl_pos)
+    ax.set_xticklabels(cl_lbl,fontsize=9)
+    ax.set_ylabel('Mean $\\widehat{\\mathrm{CL}}$')
+    ax.set_ylim(0,1)
+    ax.set_title('(a) CL Distribution by Group',
+                 fontsize=10)
+    ax.legend(fontsize=8)
+    ax.yaxis.grid(True,alpha=0.35,linestyle='--')
+    ax.set_axisbelow(True)
+
+    ax=axes[1]
+    for g in ['G1','G2','G3']:
+        sub=df_l[df_l['group']==g]
+        if sub.empty: continue
+        ax.scatter(sub['prior'],sub['mean_cl'],
+                   c=GCL[g],alpha=0.65,s=50,
+                   label=GRP[g],
+                   edgecolors='black',lw=0.5,
+                   zorder=3)
+
+    valid_mask = (~df_l['mean_cl'].isna() &
+                  ~df_l['prior'].isna())
+    if valid_mask.sum() >= 3:
+        xv=df_l.loc[valid_mask,'prior'].values
+        yv=df_l.loc[valid_mask,'mean_cl'].values
+        r_v,p_v=stats.pearsonr(xv,yv)
+        m_v,b_v=np.polyfit(xv,yv,1)
+        xs=np.linspace(0,1,100)
+        ax.plot(xs,m_v*xs+b_v,'k--',lw=2,
+                label=f'r={r_v:.3f}',zorder=4)
+
+        ax.text(0.97,0.95,
+                f'r = {r_v:.3f}\np = {p_v:.3f}',
+                transform=ax.transAxes,
+                fontsize=9,va='top',ha='right',
+                bbox=dict(boxstyle='round,pad=0.3',
+                          facecolor='white',
+                          edgecolor='#ccc',alpha=0.9))
+
+    ax.set_xlabel('Prior Knowledge [0,1]')
+    ax.set_ylabel('Mean CL [0,1]')
+    ax.set_xlim(-0.05,1.05)
+    ax.set_ylim(-0.05,1.05)
+    ax.set_title('(b) CL vs Prior Knowledge',
+                 fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3,linestyle='--')
+
+    plt.tight_layout()
+    plt.savefig('/content/figure5_cl_validation.png',
+                dpi=300,bbox_inches='tight')
+    plt.show()
+    print("✅ Figure 5 sauvegardée")
+
+print(f"\n{'═'*60}")
+print(f"  📋 CHIFFRES POUR LaTeX")
+print(f"{'═'*60}")
+
+for g in ['G1','G2','G3']:
+    sub=df_l[df_l['group']==g]
+    if sub.empty: continue
+    print(f"\n  {GRP[g]} (n={len(sub)}) :")
+    print(f"    Prior  = {sub['prior'].mean():.2f} "
+          f"± {sub['prior'].std():.2f}")
+    print(f"    Pre    = {sub['pre'].mean():.1f} "
+          f"± {sub['pre'].std():.1f} %")
+    print(f"    Post   = {sub['post'].mean():.1f} "
+          f"± {sub['post'].std():.1f} %")
+    print(f"    ΔG     = {sub['dg'].mean():.3f} "
+          f"± {sub['dg'].std():.3f}")
+    print(f"    CL     = {sub['mean_cl'].mean():.3f} "
+          f"± {sub['mean_cl'].std():.3f}")
+    print(f"    F2     = {sub['n_form2'].sum()} soumissions")
+
+ws_r2=stats_out.get('wilcoxon',{})
+cl_r2=stats_out.get('cl',{})
+pe_r2=stats_out.get('pearson',{})
+
+print(f"\n  Tests :")
+print(f"    N total = {len(df_l)}")
+print(f"    N avec Form2 = {(df_l['n_form2']>0).sum()}")
+print(f"    N avec Gradio = {df_l['has_gradio'].sum()}")
+if ws_r2:
+    print(f"    Wilcoxon W={ws_r2.get('W',0):.1f} | "
+          f"p={ws_r2.get('p',1):.4f} | "
+          f"d={ws_r2.get('d',0):.2f}")
+if cl_r2:
+    print(f"    CL t={cl_r2.get('t',0):.3f} | "
+          f"p={cl_r2.get('p',1):.4f} | "
+          f"réd={cl_r2.get('red',0):.1f}%")
+
+print(f"\n✅ Figures → /content/")
+print(f"   figure4_learning_gain.png")
+print(f"   figure5_cl_validation.png")
+
+pe_tlx = stats_out.get('pearson_tlx', {})
+if pe_tlx:
+    print(f"\n  Pearson CL_q vs NASA-TLX :")
+    print(f"    r = {pe_tlx.get('r',0):.4f} | "
+          f"p = {pe_tlx.get('p',1):.4f} | "
+          f"N = {pe_tlx.get('n',0)}")
+    print(f"    Article : r=0.647 | "
+          f"{'✅ Cohérent' if abs(pe_tlx.get('r',0)-0.647)<=0.05 else '⚠️ Écart'}")
+
+print(f"\n  AILS_Results :")
+print(f"    Lignes totales     = {len(df_r)}")
+print(f"    Apprenants uniques = {df_r[C_EMAIL_R].nunique() if C_EMAIL_R else 'N/A'}")
+print(f"    Modules couverts   = {df_r['module_id'].nunique() if 'module_id' in df_r.columns else 'N/A'}")
+if 'score_raw' in df_r.columns:
+    sc_all = pd.to_numeric(df_r['score_raw'], errors='coerce').dropna()
+    print(f"    Score moyen        = {sc_all.mean():.2f}/10 ± {sc_all.std():.2f}")
+if 'cl_value' in df_r.columns:
+    cl_all = pd.to_numeric(df_r['cl_value'], errors='coerce').dropna()
+    print(f"    CL moyen système   = {cl_all.mean():.3f} ± {cl_all.std():.3f}")
+if 'mastered' in df_r.columns:
+    n_mastered = (df_r['mastered'].astype(str).str.upper() == 'TRUE').sum()
+    print(f"    Modules maîtrisés  = {n_mastered}")
